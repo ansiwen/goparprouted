@@ -3,53 +3,53 @@
 
 package notifier
 
-import "sync"
+import (
+	"github.com/ansiwen/goparprouted/internal/lflist"
+)
 
-type channelMapVal[V comparable] struct {
+type channelListVal[V comparable] struct {
 	ch  chan struct{}
 	val V
 }
 
-type channelMap[V comparable] map[<-chan struct{}]channelMapVal[V]
+type channelList[V comparable] lflist.Simple[channelListVal[V]]
 
-type T[V comparable] struct {
-	channels channelMap[V]
-	mtx      sync.Mutex
+type Notifier[V comparable] struct {
+	channels lflist.Simple[channelListVal[V]]
 }
 
-func (n *T[V]) Add(val V) <-chan struct{} {
-	n.mtx.Lock()
-	defer n.mtx.Unlock()
-	_ = isComparable[V]
+func (n *Notifier[V]) Add(val V) Slot[V] {
 	ch := make(chan struct{})
-	if n.channels == nil {
-		n.channels = make(channelMap[V])
-	}
-	n.channels[ch] = channelMapVal[V]{ch: ch, val: val}
-	return ch
+	node := n.channels.Add(&channelListVal[V]{ch: ch, val: val})
+	return Slot[V]{node}
 }
 
-func (n *T[V]) Remove(rch <-chan struct{}) {
-	n.mtx.Lock()
-	defer n.mtx.Unlock()
-	if v, ok := n.channels[rch]; ok {
-		close(v.ch)
-	}
-	delete(n.channels, rch)
-}
-
-func (n *T[V]) Notify(val V) {
-	n.mtx.Lock()
-	defer n.mtx.Unlock()
-	for _, v := range n.channels {
+func (n *Notifier[V]) Notify(val V) {
+	for i := n.channels.Begin(); i != nil; i = i.Next() {
+		v := i.Val()
 		if v.val == val {
 			v.ch <- struct{}{}
 		}
 	}
 }
 
-func (n *T[V]) Pending() int {
-	return len(n.channels)
+func (n *Notifier[V]) Pending() int {
+	count := 0
+	for i := n.channels.Begin(); i != nil; i = i.Next() {
+		count++
+	}
+	return count
 }
 
-func isComparable[_ comparable]() {}
+type Slot[V comparable] struct {
+	node *lflist.SimpleNode[channelListVal[V]]
+}
+
+func (r *Slot[V]) Remove() {
+	close(r.node.Val().ch)
+	r.node.Delete()
+}
+
+func (r *Slot[V]) Ch() <-chan struct{} {
+	return r.node.Val().ch
+}

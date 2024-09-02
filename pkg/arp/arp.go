@@ -5,12 +5,13 @@ import (
 	"log"
 	"net"
 	"net/netip"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ansiwen/goparprouted/internal/lflist"
 	"github.com/ansiwen/goparprouted/internal/netlink"
 	"github.com/ansiwen/goparprouted/internal/notifier"
+
 	"github.com/mdlayher/arp"
 	"github.com/mdlayher/ethernet"
 )
@@ -22,10 +23,10 @@ const (
 	arpTableRefreshInterval = 50 * time.Second
 )
 
-var getID = func() func() uint {
-	var id atomic.Uintptr
-	return func() uint {
-		return uint(id.Add(1))
+var getID = func() func() uint64 {
+	var id atomic.Uint64
+	return func() uint64 {
+		return id.Add(1)
 	}
 }()
 
@@ -36,15 +37,10 @@ type arpTableEntry struct {
 	Timestamp time.Time
 }
 
-type arpTable struct {
-	entries map[netip.Addr]*arpTableEntry
-	mtx     sync.Mutex
-}
-
 type ARPProxy struct {
-	arpTable     arpTable
+	arpTable     lflist.Assoc[netip.Addr, arpTableEntry]
 	arpListeners []*listener
-	notifier     notifier.T[netip.Addr]
+	notifier     notifier.Notifier[netip.Addr]
 	debug        bool
 	defaultRoute bool
 	arpPerm      bool
@@ -59,13 +55,12 @@ type listener struct {
 
 type context struct {
 	*listener
-	id  uint
+	id  uint64
 	pkt *arp.Packet
 }
 
 func NewARPProxy() *ARPProxy {
 	var ap ARPProxy
-	ap.arpTable.entries = make(map[netip.Addr]*arpTableEntry)
 	return &ap
 }
 
@@ -108,18 +103,7 @@ func (ap *ARPProxy) Cleanup() {
 	ap.sweepARPTable(true)
 }
 
-func (ap *ARPProxy) getEntry(ipAddr netip.Addr) (*arpTableEntry, bool) {
-	ap.arpTable.mtx.Lock()
-	defer ap.arpTable.mtx.Unlock()
-
-	entry, exists := ap.arpTable.entries[ipAddr]
-	return entry, exists
-}
-
 func (ap *ARPProxy) sweepARPTable(cleanup bool) {
-	ap.arpTable.mtx.Lock()
-	defer ap.arpTable.mtx.Unlock()
-
 	refreshEntry := func(entry *arpTableEntry) {
 		var client *arp.Client
 		for _, l := range ap.arpListeners {
@@ -148,9 +132,10 @@ func (ap *ARPProxy) sweepARPTable(cleanup bool) {
 		}
 	}
 
-	removeEntry := func(entry *arpTableEntry) {
+	removeEntry := func(n *lflist.AssocNode[netip.Addr, arpTableEntry]) {
+		entry := n.Val()
 		ap.trace("Removing expired entry for %s", entry.IPAddr)
-		delete(ap.arpTable.entries, entry.IPAddr)
+		n.Delete()
 		if entry.isNegative() {
 			return
 		}
@@ -166,13 +151,14 @@ func (ap *ARPProxy) sweepARPTable(cleanup bool) {
 
 	ap.trace("Sweeping ARP table entries")
 
-	for _, entry := range ap.arpTable.entries {
+	for n := ap.arpTable.Begin(); n != nil; n = n.Next() {
+		entry := n.Val()
 		age := time.Since(entry.Timestamp)
 		if !cleanup && !entry.isNegative() && age > arpTableRefreshInterval {
 			refreshEntry(entry)
 		}
 		if cleanup || age > arpTableEntryTimeout {
-			removeEntry(entry)
+			removeEntry(n)
 		}
 	}
 }
@@ -193,8 +179,9 @@ func (l *listener) start() {
 			log.Printf("Error reading ARP packet on interface %s: %v", l.iface.Name, err)
 			continue
 		}
-		if !l.current.register(pkt) {
-			l.trace("Skipping duplicate packet on %s: %s (reg size: %d)", l.iface.Name, pktStr(pkt), len(l.current.pkts))
+		reg := l.current.register(pkt)
+		if reg == nil {
+			l.trace("Skipping duplicate packet on %s: %s (reg size: %d)", l.iface.Name, pktStr(pkt), l.current.pkts.Size())
 			continue
 		}
 		ctx := context{
@@ -212,7 +199,7 @@ func (l *listener) start() {
 			default:
 				log.Printf("Invalid ARP packet: %s", pktStr(pkt))
 			}
-			l.current.unregister(pkt)
+			unregister(reg)
 			ctx.trace("Finished")
 		}()
 	}
@@ -223,23 +210,29 @@ func (ctx *context) handleARPRequest() {
 	logErr := errLogger("Failed to handle ARP Request")
 
 	handleWithARPTable := func() bool {
-		if entry, exists := ctx.getEntry(req.TargetIP); exists {
-			if !entry.isNegative() {
-				if entry.Interface != ctx.iface {
-					ctx.trace("Sending ARP proxy reply to %s on interface %s", ctx.pkt.SenderIP, ctx.iface.Name)
-					if err := ctx.client.Reply(ctx.pkt, ctx.iface.HardwareAddr, ctx.pkt.TargetIP); err != nil {
-						log.Printf("sendReply: arp.Client.Reply: %v", err)
-					}
-				} else {
-					ctx.trace("Found entry from same interface, ignoring request for %s from %s on interface %s", ctx.pkt.TargetIP, ctx.pkt.SenderIP, ctx.iface.Name)
+		node := ctx.arpTable.Load(req.TargetIP)
+		if node == nil {
+			return false
+		}
+		entry := node.Val()
+		if entry == nil {
+			return false
+		}
+		if !entry.isNegative() {
+			if entry.Interface != ctx.iface {
+				ctx.trace("Sending ARP proxy reply to %s on interface %s", ctx.pkt.SenderIP, ctx.iface.Name)
+				if err := ctx.client.Reply(ctx.pkt, ctx.iface.HardwareAddr, ctx.pkt.TargetIP); err != nil {
+					log.Printf("sendReply: arp.Client.Reply: %v", err)
 				}
-				return true
+			} else {
+				ctx.trace("Found entry from same interface, ignoring request for %s from %s on interface %s", ctx.pkt.TargetIP, ctx.pkt.SenderIP, ctx.iface.Name)
 			}
-			// negative entry
-			if entry.Interface == ctx.iface {
-				ctx.trace("Found matching negative entry, ignoring request for %s from %s on interface %s", ctx.pkt.TargetIP, ctx.pkt.SenderIP, ctx.iface.Name)
-				return true
-			}
+			return true
+		}
+		// negative entry
+		if entry.Interface == ctx.iface {
+			ctx.trace("Found matching negative entry, ignoring request for %s from %s on interface %s", ctx.pkt.TargetIP, ctx.pkt.SenderIP, ctx.iface.Name)
+			return true
 		}
 		return false
 	}
@@ -273,20 +266,17 @@ func (ctx *context) handleARPRequest() {
 		}
 	} else {
 		ctx.trace("ARP Request timed out, creating negative entry for %s on %s", req.TargetIP, ctx.iface.Name)
-		ctx.arpTable.mtx.Lock()
 		// make sure we never overwrite another entry
-		if _, exists := ctx.arpTable.entries[req.TargetIP]; !exists {
-			entry := &arpTableEntry{
-				IPAddr:    req.TargetIP,
-				HWAddr:    nil,
-				Interface: ctx.iface, // in negative entries this is the interface the request was _coming_ from
-				Timestamp: time.Now(),
-			}
-			ctx.arpTable.entries[req.TargetIP] = entry
-		} else {
+		entry := &arpTableEntry{
+			IPAddr:    req.TargetIP,
+			HWAddr:    nil,
+			Interface: ctx.iface, // in negative entries this is the interface the request was _coming_ from
+			Timestamp: time.Now(),
+		}
+		_, existed := ctx.arpTable.LoadOrStore(req.TargetIP, entry)
+		if existed {
 			ctx.trace("Creating negative entry failed, another entry exists.")
 		}
-		defer ctx.arpTable.mtx.Unlock()
 	}
 }
 
@@ -298,9 +288,13 @@ func (ctx *context) handleARPReply() {
 		return
 	}
 
-	newEntry := false
-	if entry, exists := ctx.getEntry(reply.SenderIP); !exists || entry.isNegative() || entry.Interface != ctx.iface {
-		newEntry = true
+	newEntry := true
+	existingNode := ctx.arpTable.Load(reply.SenderIP)
+	if existingNode != nil {
+		entry := existingNode.Val()
+		if entry != nil && !entry.isNegative() && !(entry.Interface != ctx.iface) {
+			newEntry = false
+		}
 	}
 
 	if newEntry {
@@ -310,18 +304,15 @@ func (ctx *context) handleARPReply() {
 		ctx.trace("Updateing ARP entry for %s to %s on %s", reply.SenderIP, reply.SenderHardwareAddr, ctx.iface.Name)
 	}
 
-	ctx.arpTable.mtx.Lock()
-	defer ctx.arpTable.mtx.Unlock()
-
 	entry := &arpTableEntry{
 		IPAddr:    reply.SenderIP,
 		HWAddr:    reply.SenderHardwareAddr,
 		Interface: ctx.iface,
 		Timestamp: time.Now(),
 	}
-
-	key := entry.IPAddr
-	ctx.arpTable.entries[key] = entry
+	if existingNode == nil || !existingNode.ReplaceVal(entry) {
+		ctx.arpTable.Store(entry.IPAddr, entry)
+	}
 
 	// Update kernel ARP table
 	if err := netlink.UpdateKernelARPTable(reply.SenderIP.AsSlice(), reply.SenderHardwareAddr, ctx.iface, ctx.arpPerm); err != nil {
@@ -341,11 +332,11 @@ func (ctx *context) handleARPReply() {
 }
 
 func (ctx *context) waitFor(ip netip.Addr, timeout time.Duration) bool {
+	slot := ctx.notifier.Add(ip)
 	ctx.trace("Waiting for %s entry (notifylist size: %d)", ip, ctx.notifier.Pending())
-	notify := ctx.notifier.Add(ip)
-	defer ctx.notifier.Remove(notify)
+	defer slot.Remove()
 	select {
-	case <-notify:
+	case <-slot.Ch():
 		ctx.trace("Received notification for %s", ip)
 		return true
 	case <-time.After(timeout):
@@ -383,27 +374,19 @@ func (ctx *context) trace(format string, v ...any) {
 }
 
 type pktRegistry struct {
-	pkts map[string]struct{}
-	mtx  sync.Mutex
+	pkts lflist.Assoc[string, struct{}]
 }
 
-func (v *pktRegistry) register(pkt *arp.Packet) bool {
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
+func (v *pktRegistry) register(pkt *arp.Packet) *lflist.AssocNode[string, struct{}] {
 	data, _ := pkt.MarshalBinary()
-	_, exists := v.pkts[string(data)]
-	if !exists {
-		if v.pkts == nil {
-			v.pkts = make(map[string]struct{})
-		}
-		v.pkts[string(data)] = struct{}{}
+	dataStr := string(data)
+	node, exists := v.pkts.Store(dataStr, &struct{}{})
+	if exists {
+		return nil
 	}
-	return !exists
+	return node
 }
 
-func (v *pktRegistry) unregister(pkt *arp.Packet) {
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
-	data, _ := pkt.MarshalBinary()
-	delete(v.pkts, string(data))
+func unregister(n *lflist.AssocNode[string, struct{}]) {
+	n.Delete()
 }
